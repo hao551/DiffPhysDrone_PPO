@@ -1,0 +1,6 @@
+--gate
+--coef_collide 5.0
+--coef_obj_avoidance 2.0
+--batch 256
+--fov_x_half_tan 0.82
+--timesteps 180
