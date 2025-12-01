@@ -52,9 +52,10 @@ To start the training process, use the following command:
 python main_cuda.py $(cat configs/multi_agent.args)
 # For single-agemt
 python main_cuda.py $(cat configs/single_agent.args)
-```
-
+# For PPO training (single-agent)
+python ppo_trainer.py $(cat configs/single_agent.args)
 ## Evaluation
+
 You need to download the simulation validation code from the GitHub release page.
 To evaluate the trained model in multi-agent settings, use the following command to launch the simulator:
 ```bash
