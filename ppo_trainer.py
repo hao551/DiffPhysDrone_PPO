@@ -22,7 +22,7 @@ def parse_args():
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--batch_size", type=int, default=512)
-    parser.add_argument("--num_updates", type=int, default=6000)
+    parser.add_argument("--num_updates", type=int, default=8000)
     parser.add_argument("--num_steps", type=int, default=256)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--gae_lambda", type=float, default=0.95)
@@ -37,7 +37,7 @@ def parse_args():
     parser.add_argument("--linear_lr", action="store_true", default=True)
     parser.add_argument("--hidden_size", type=int, default=192)
     parser.add_argument("--seq_len", type=int, default=32, help="Sequence length for RNN training")
-    parser.add_argument("--log_dir", type=str, default="runs/ppo_3")
+    parser.add_argument("--log_dir", type=str, default="runs/ppo")
     parser.add_argument("--save_interval", type=int, default=50000)
     parser.add_argument("--ctl_dt_mean", type=float, default=1 / 15)
     parser.add_argument("--ctl_dt_std", type=float, default=0.1 / 15)
@@ -81,6 +81,9 @@ def parse_args():
     parser.add_argument("--yaw_drift", action="store_true")
     #只有你在命令行加 --no_odom 时，args.no_odom 才会变成 True
     parser.add_argument("--no_odom", action="store_true")
+    # 评估相关参数：每多少个 update 跑一次 evaluation；0 表示不评估
+    parser.add_argument("--eval_interval", type=int, default=100, help="Run evaluation every N updates (0 to disable)")
+    parser.add_argument("--eval_num_steps", type=int, default=256, help="Number of steps per evaluation rollout")
     
     return parser.parse_args()
 
@@ -221,6 +224,209 @@ def prepare_env(args, device):
 def sample_ctl_dt(args):
     ctl_dt = random.gauss(args.ctl_dt_mean, args.ctl_dt_std)
     return max(1e-3, ctl_dt)
+
+
+@torch.no_grad()
+def evaluate_policy(model, args, device, writer, global_step):
+    """
+    使用 dist.mean() 作为确定性动作，在独立环境上评估策略的成功率 / 碰撞率等，
+    并把结果写入 TensorBoard 的 eval/* 曲线。
+    """
+    if writer is None or args.eval_interval <= 0:
+        return
+
+    model.eval()
+
+    # 单独创建一套评估环境，避免干扰训练环境
+    env, template_env = prepare_env(args, device)
+    env.reset()
+    model.reset()
+
+    hidden_state = None
+    last_done = torch.zeros(args.batch_size, device=device)
+
+    act_buffer = deque(maxlen=args.act_lag + 1)
+    for _ in range(args.act_lag + 1):
+        act_buffer.append(env.act.clone().detach())
+    prev_action = env.act.clone().detach()
+    prev_prev_action = prev_action.clone()
+    prev_distance = torch.zeros(args.batch_size, device=device)
+    distance_initialized = torch.zeros(args.batch_size, dtype=torch.bool, device=device)
+    disable_partial_reset = args.disable_partial_reset
+
+    yaw_drift = None
+    if args.yaw_drift:
+        drift_av = torch.randn(args.batch_size, device=device) * (5 * math.pi / 180 / 15)
+        zeros = torch.zeros_like(drift_av)
+        ones = torch.ones_like(drift_av)
+        yaw_drift = torch.stack(
+            [
+                torch.cos(drift_av),
+                -torch.sin(drift_av),
+                zeros,
+                torch.sin(drift_av),
+                torch.cos(drift_av),
+                zeros,
+                zeros,
+                zeros,
+                ones,
+            ],
+            -1,
+        ).reshape(args.batch_size, 3, 3)
+
+    ctl_dt = sample_ctl_dt(args)
+    obs = build_observation(env, ctl_dt, args, yaw_drift)
+
+    collision_count = 0.0
+    success_count = 0.0
+    step_count = 0
+
+    # 按 episode 统计
+    episodes_success = 0
+    episodes_collision = 0
+    episodes_other = 0
+
+    episode_returns = torch.zeros(args.batch_size, device=device)
+    episode_lengths = torch.zeros(args.batch_size, device=device)
+    eval_returns = []
+    eval_lengths = []
+
+    num_steps = max(1, args.eval_num_steps)
+
+    for _ in range(num_steps):
+        depth = obs["depth"]
+        state_vec = obs["state"]
+
+        hx_in = hidden_state.detach() if hidden_state is not None else None
+        dist, value, next_hx = model.get_dist(depth, state_vec, hidden_state)
+
+        # 使用策略分布的均值作为确定性动作，相当于“测试集推理”
+        action = dist.mean
+        centered_action = 2.0 * action - 1.0
+        act_cmd, a_pred, v_pred = convert_action(centered_action, obs["R_body"], env)
+
+        executed_act = act_buffer[0]
+        env.run(executed_act, ctl_dt, obs["target_v_raw"])
+        act_buffer.append(act_cmd.detach())
+
+        vec_to_pt = env.find_vec_to_nearest_pt()
+        distance = torch.norm(vec_to_pt, 2, -1) - env.margin
+        approach = torch.zeros_like(distance)
+        if distance_initialized.any():
+            approach = (prev_distance - distance) * args.avoid_velocity_scale
+            approach = torch.where(distance_initialized, approach, torch.zeros_like(distance))
+        v_to_pt = torch.clamp(approach, min=1.0)
+
+        vel_tracking = F.smooth_l1_loss(env.v, obs["target_v_world"], reduction="none").mean(-1)
+        target_dir = obs["target_dir_world"]
+        fwd_v = torch.sum(env.v * target_dir, -1)
+        bias_loss = (
+            F.mse_loss(env.v, fwd_v[..., None] * target_dir, reduction="none").mean(-1) * 3.0
+        )
+        speed_loss = F.smooth_l1_loss(fwd_v, obs["target_speed"], reduction="none")
+
+        loss_obj_avoidance = (v_to_pt * (1 - distance).relu().pow(2)).mean(0)
+        loss_collide = (F.softplus(distance.mul(-32.0)) * v_to_pt).mean(0)
+        loss_ground = env.p[:, 2].relu().pow(2)
+        loss_d_acc = executed_act.pow(2).sum(-1)
+        jerk = (executed_act - prev_action) * args.jerk_scale
+        loss_d_jerk = jerk.pow(2).sum(-1)
+
+        new_goal_distance = torch.norm(env.p_target - env.p, 2, -1)
+
+        raw_progress = obs["goal_distance"] - new_goal_distance
+        progress_pos = torch.clamp(raw_progress, 0.0, args.progress_clip)
+        progress_neg = torch.clamp(-raw_progress, 0.0, args.progress_clip)
+        progress = progress_pos - progress_neg
+
+        collided = (distance < 0).any(0)
+        success = (~collided) & (new_goal_distance < args.success_radius)
+        done = collided | success
+
+        smooth_penalty = (
+            args.coef_d_acc * loss_d_acc
+            + args.coef_d_jerk * loss_d_jerk
+        )
+        collision_shaping = (
+            args.coef_obj_avoidance * loss_obj_avoidance
+            + args.coef_collide * loss_collide
+        )
+
+        reward = (
+            args.progress_coef * progress_pos
+            - 0.3 * args.progress_coef * progress_neg
+        )
+        reward -= args.coef_bias * bias_loss
+        reward -= smooth_penalty
+        reward -= collision_shaping
+        reward -= args.collision_penalty * collided.float()
+        reward += args.success_reward * success.float()
+        goal_bonus = args.coef_goal_bonus * torch.exp(-new_goal_distance / 3.0)
+        reward += goal_bonus
+
+        episode_returns += reward
+        episode_lengths += 1
+
+        collision_count += collided.float().sum().item()
+        success_count += success.float().sum().item()
+        step_count += 1
+
+        completed = done.nonzero(as_tuple=False).squeeze(-1)
+        if completed.numel() > 0:
+            ep_success = success[completed].float().sum().item()
+            ep_collision = collided[completed].float().sum().item()
+            episodes_success += ep_success
+            episodes_collision += ep_collision
+            episodes_other += completed.numel() - ep_success - ep_collision
+
+            eval_returns.extend(episode_returns[completed].detach().cpu().tolist())
+            eval_lengths.extend(episode_lengths[completed].detach().cpu().tolist())
+            episode_returns[completed] = 0
+            episode_lengths[completed] = 0
+
+        prev_prev_action = prev_action.clone()
+        prev_action = executed_act.detach()
+        prev_distance = distance.detach()
+        distance_initialized[:] = True
+
+        if not disable_partial_reset:
+            partial_reset(env, template_env, done, act_buffer)
+            if done.any():
+                distance_initialized[done] = False
+                if prev_distance.ndim == 2:
+                    prev_distance[:, done] = 0
+                else:
+                    prev_distance[done] = 0
+                prev_action[done] = env.act[done].detach()
+                prev_prev_action[done] = env.act[done].detach()
+        if next_hx is not None:
+            hidden_state = next_hx.detach()
+            hidden_state[done] = 0
+        else:
+            hidden_state = None
+        last_done = done.float()
+
+        ctl_dt = sample_ctl_dt(args)
+        obs = build_observation(env, ctl_dt, args, yaw_drift)
+
+    # ---- 汇总并写入 TensorBoard ----
+    avg_reward = (sum(eval_returns) / len(eval_returns)) if eval_returns else 0.0
+    avg_length = (sum(eval_lengths) / len(eval_lengths)) if eval_lengths else 0.0
+    collision_rate = collision_count / max(1, step_count * args.batch_size)
+    success_rate = success_count / max(1, step_count * args.batch_size)
+
+    episodes_total = max(1, episodes_success + episodes_collision + episodes_other)
+    episode_success_rate = episodes_success / episodes_total
+    episode_collision_rate = episodes_collision / episodes_total
+
+    # writer.add_scalar("eval/avg_reward", avg_reward, global_step)
+    # writer.add_scalar("eval/avg_length", avg_length, global_step)
+    # writer.add_scalar("eval/collision_rate", collision_rate, global_step)
+    # writer.add_scalar("eval/success_rate", success_rate, global_step)
+    writer.add_scalar("eval/episode_success_rate", episode_success_rate, global_step)
+    writer.add_scalar("eval/episode_collision_rate", episode_collision_rate, global_step)
+
+    model.train()
 
 
 def main():
@@ -711,6 +917,10 @@ def main():
                 reward_trackers["goal_bonus"] / denom,
                 global_step,
             )
+
+        # 定期在独立环境上用 dist.mean() 做一次“测试集”评估
+        if args.eval_interval > 0 and (update + 1) % args.eval_interval == 0:
+            evaluate_policy(model, args, device, writer, global_step)
 
         if args.save_interval > 0 and (update + 1) % args.save_interval == 0:
             save_path = os.path.join(args.log_dir, f"ppo_checkpoint_{update+1:05d}.pth")
