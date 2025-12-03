@@ -71,6 +71,10 @@ class PPONetwork(nn.Module):
         # 只要求 hx 的 最后一维 是 192
         # 前面的那个维度（batch）PyTorch 自动按“多个样本并行”处理
         #其实其他的网络定义也是如此
+        
+        #每一步输入当前 depth + state，GRU 更新得到隐藏状态 ht
+        #actor 头用 ht 计算动作分布的参数来决定当前动作分布，critic 头用 ht 计算状态价值函数 V(s)用来算 advantage / value loss
+        #所以可以理解为：GRU 在学习一个“总结历史观测的隐状态”，让策略和价值都基于这个带记忆的表示来做决策，而不是在预测某个单独的物理量（位置、速度之类
         hx = self.gru(feat, hx)
         return hx
 

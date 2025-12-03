@@ -22,7 +22,7 @@ def parse_args():
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--batch_size", type=int, default=512)
-    parser.add_argument("--num_updates", type=int, default=4000)
+    parser.add_argument("--num_updates", type=int, default=6000)
     parser.add_argument("--num_steps", type=int, default=256)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--gae_lambda", type=float, default=0.95)
@@ -37,36 +37,37 @@ def parse_args():
     parser.add_argument("--linear_lr", action="store_true", default=True)
     parser.add_argument("--hidden_size", type=int, default=192)
     parser.add_argument("--seq_len", type=int, default=32, help="Sequence length for RNN training")
-    parser.add_argument("--log_dir", type=str, default="runs/ppo")
+    parser.add_argument("--log_dir", type=str, default="runs/ppo_3")
     parser.add_argument("--save_interval", type=int, default=50000)
     parser.add_argument("--ctl_dt_mean", type=float, default=1 / 15)
     parser.add_argument("--ctl_dt_std", type=float, default=0.1 / 15)
     parser.add_argument("--act_lag", type=int, default=1)
+    
     parser.add_argument("--disable_partial_reset", action="store_true")
     # 稀疏成功奖励：episode 成功结束时一次性加的 bonus
-    parser.add_argument("--success_reward", type=float, default=20.0)
+    parser.add_argument("--success_reward", type=float, default=50.0)
     parser.add_argument("--success_radius", type=float, default=1)
-    parser.add_argument("--collision_penalty", type=float, default=2.0)
-    parser.add_argument("--progress_coef", type=float, default=3.0)
+    parser.add_argument("--collision_penalty", type=float, default=10.0)
+    parser.add_argument("--progress_coef", type=float, default=3.5)
     parser.add_argument("--progress_clip", type=float, default=2.0)
     parser.add_argument("--avoid_velocity_scale", type=float, default=135.0)
     parser.add_argument("--jerk_scale", type=float, default=15.0)
     parser.add_argument("--snap_scale", type=float, default=15.0 ** 2)
-
+    
     # reward weights mirroring the supervised losses
     parser.add_argument("--coef_v", type=float, default=4.0)
     parser.add_argument("--coef_speed", type=float, default=0.0)
     parser.add_argument("--coef_v_pred", type=float, default=2.0)
-    parser.add_argument("--coef_collide", type=float, default=0.3)
-    parser.add_argument("--coef_obj_avoidance", type=float, default=0.1)
+    parser.add_argument("--coef_collide", type=float, default=0.5)
+    parser.add_argument("--coef_obj_avoidance", type=float, default=0.15)
     parser.add_argument("--coef_d_acc", type=float, default=0.02)
     parser.add_argument("--coef_d_jerk", type=float, default=0.0005)
     parser.add_argument("--coef_d_snap", type=float, default=0.0)
     parser.add_argument("--coef_ground_affinity", type=float, default=0.0)
-    parser.add_argument("--coef_bias", type=float, default=0.01)
+    parser.add_argument("--coef_bias", type=float, default=0.005)
     parser.add_argument("--coef_alive", type=float, default=0.05, help="Bonus for staying alive per step")
     parser.add_argument("--coef_goal_bonus", type=float, default=2.0, help="Bonus for getting closer to the goal")
-
+    
     # environment flags
     parser.add_argument("--grad_decay", type=float, default=0.4)
     parser.add_argument("--speed_mtp", type=float, default=1.0)
@@ -105,7 +106,7 @@ def build_observation(env: Env, ctl_dt: float, args, yaw_drift: Optional[torch.T
     depth, _ = env.render(ctl_dt)
     depth = 3 / depth.clamp(0.3, 24) - 0.6 + torch.randn_like(depth) * 0.02
     depth = F.max_pool2d(depth[:, None], 4, 4)
-
+    
     R_body = build_rotation(env)
 
     target_v_raw = env.p_target - env.p.detach()
@@ -271,14 +272,14 @@ def main():
             frac = 1.0 - update / max(1, args.num_updates)
             optim.param_groups[0]["lr"] = args.lr * frac
 
-        # 熵系数调度：前 2/3 训练保持不变，最后 1/3 线性衰减到 0
-        # 用 (update + 1) / num_updates 这样最后一轮刚好衰减到 0
+        # 熵系数调度：前 2/3 训练保持不变，最后 1/3 使用余弦衰减到 0
+        # 用 (update + 1) / num_updates 这样最后一轮刚好走到进度 1.0
         ent_progress = (update + 1) / max(1, args.num_updates)
         if ent_progress <= 2.0 / 3.0:
             ent_coef_now = args.ent_coef
         else:
             decay_frac = (ent_progress - 2.0 / 3.0) / (1.0 / 3.0)
-            ent_coef_now = args.ent_coef * max(0.0, 1.0 - decay_frac)
+            ent_coef_now = args.ent_coef * max(0.1, 1.0 - decay_frac)
 
         env.reset()
         model.reset()
@@ -523,7 +524,7 @@ def main():
         # 每个 PPO update 更新一次全局统计量，每次用的是整批 T×B 的数据”，而不是“每个时间步单独 update 一次”。
         # buffer.returns: [T, B]，先在最后一维加一个 size=1 的维度，匹配 ValueNorm(input_shape=1)
         returns_vec = buffer.returns.unsqueeze(-1)          # [T, B, 1]
-        #保证在T，B维度上更新均值和方差，注意是两个一块
+        #保证在T，B维度上滑动指数更新均值和方差，注意是两个一块
         value_norm.update(returns_vec)                      # 更新滑动均值 / 方差
         mean, var = value_norm.running_mean_var()           # 得到去偏均值/方差
         # 把标准化后的 returns 写回 buffer，保持形状仍然是 [T, B]
