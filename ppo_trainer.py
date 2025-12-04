@@ -26,7 +26,7 @@ def parse_args():
     parser.add_argument("--num_steps", type=int, default=256)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--gae_lambda", type=float, default=0.95)
-    parser.add_argument("--ppo_epochs", type=int, default=4)
+    parser.add_argument("--ppo_epochs", type=int, default=6)
     parser.add_argument("--num_minibatches", type=int, default=8)
     parser.add_argument("--clip_range", type=float, default=0.15)
     parser.add_argument("--clip_vloss", type=float, default=0.2)
@@ -37,7 +37,7 @@ def parse_args():
     parser.add_argument("--linear_lr", action="store_true", default=True)
     parser.add_argument("--hidden_size", type=int, default=192)
     parser.add_argument("--seq_len", type=int, default=32, help="Sequence length for RNN training")
-    parser.add_argument("--log_dir", type=str, default="runs/ppo")
+    parser.add_argument("--log_dir", type=str, default="runs/ppo_1")
     parser.add_argument("--save_interval", type=int, default=50000)
     parser.add_argument("--ctl_dt_mean", type=float, default=1 / 15)
     parser.add_argument("--ctl_dt_std", type=float, default=0.1 / 15)
@@ -240,9 +240,9 @@ def evaluate_policy(model, args, device, writer, global_step):
     # 单独创建一套评估环境，避免干扰训练环境
     env, template_env = prepare_env(args, device)
     env.reset()
-    model.reset()
+    model.reset()#：占位，保持 API 一致性（虽然目前是空的）
 
-    hidden_state = None
+    hidden_state = None#真正重置 GRU 的隐状态
     last_done = torch.zeros(args.batch_size, device=device)
 
     act_buffer = deque(maxlen=args.act_lag + 1)
@@ -298,6 +298,7 @@ def evaluate_policy(model, args, device, writer, global_step):
         state_vec = obs["state"]
 
         hx_in = hidden_state.detach() if hidden_state is not None else None
+        #model.get_dist() 输出动作分布 dist、价值 value、下一隐状态 next_hx
         dist, value, next_hx = model.get_dist(depth, state_vec, hidden_state)
 
         # 使用策略分布的均值作为确定性动作，相当于“测试集推理”
@@ -341,6 +342,8 @@ def evaluate_policy(model, args, device, writer, global_step):
 
         collided = (distance < 0).any(0)
         success = (~collided) & (new_goal_distance < args.success_radius)
+        # collided 形状：[B]，success 形状：[B]
+        # 两个 [B] 的布尔张量做逻辑或，结果：done 形状是 [B]
         done = collided | success
 
         smooth_penalty = (
@@ -390,13 +393,21 @@ def evaluate_policy(model, args, device, writer, global_step):
         distance_initialized[:] = True
 
         if not disable_partial_reset:
+            # 这个函数做的事：用 done 这个布尔 mask（形状 [B]）找出终止的那些 env。
+            # 调 template_env.reset() 随机生成一批新的起终点、障碍物。
+            # 把这些新状态拷贝到 env 的对应 index 上（只替换 done 的那些）。
+            # 同时把 act_buffer 里对应 env 的动作重置成当前 env.act，保证动作延迟缓冲干净。
             partial_reset(env, template_env, done, act_buffer)
             if done.any():
+                #对刚刚被重置的 env，把标记改回 False，相当于告诉后面：“这是一个新 episode 的第一步，不要拿老的 prev_distance 来算靠近速度”
                 distance_initialized[done] = False
                 if prev_distance.ndim == 2:
                     prev_distance[:, done] = 0
                 else:
                     prev_distance[done] = 0
+                #把两者都设成同一个 env.act[done]，含义就是：
+                #“新 episode 的 t=0 时刻，认为 t=-1、t=-2 的历史动作也都是这个值”，这样一阶、二阶差分在起点都是 0，
+                # 不会因为切换 episode 产生虚假的抖动惩罚。
                 prev_action[done] = env.act[done].detach()
                 prev_prev_action[done] = env.act[done].detach()
         if next_hx is not None:
@@ -419,8 +430,8 @@ def evaluate_policy(model, args, device, writer, global_step):
     episode_success_rate = episodes_success / episodes_total
     episode_collision_rate = episodes_collision / episodes_total
 
-    # writer.add_scalar("eval/avg_reward", avg_reward, global_step)
-    # writer.add_scalar("eval/avg_length", avg_length, global_step)
+    writer.add_scalar("eval/avg_reward", avg_reward, global_step)
+    writer.add_scalar("eval/avg_length", avg_length, global_step)
     # writer.add_scalar("eval/collision_rate", collision_rate, global_step)
     # writer.add_scalar("eval/success_rate", success_rate, global_step)
     writer.add_scalar("eval/episode_success_rate", episode_success_rate, global_step)

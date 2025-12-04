@@ -46,11 +46,23 @@ class PPONetwork(nn.Module):
 
         #性能主要由策略的形状决定。这里输出 Beta 分布的 alpha 和 beta 两组参数。
         #因此需要输出 2 * dim_action 维度。
-        self.actor = nn.Linear(hidden_size, dim_action * 2, bias=False)
+        # self.actor = nn.Linear(hidden_size, dim_action * 2, bias=False)
+        self.actor = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size, bias=False),
+            nn.LeakyReLU(0.05),
+            nn.Linear(hidden_size, dim_action * 2, bias=False),
+        )
         #手动把权重乘 0.01，相当于减小初始权重的幅度。
-        self.actor.weight.data.mul_(0.01)
+        # self.actor.weight.data.mul_(0.01)
+        last_layer = self.actor[-1]
+        last_layer.weight.data.mul_(0.01)
         #输出状态价值 V(s)。用于 critic，参与 PPO 的 value loss。
-        self.value_head = nn.Linear(hidden_size, 1)
+        # self.value_head = nn.Linear(hidden_size, 1)
+        self.value_head = nn.Sequential(
+            nn.Linear(hidden_size, 2*hidden_size, bias=False),
+            nn.LeakyReLU(0.05),
+            nn.Linear(2*hidden_size, 1, bias=False),
+        )
 
     @torch.no_grad()
     def reset(self) -> None:
