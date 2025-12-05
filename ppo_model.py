@@ -71,6 +71,7 @@ class PPONetwork(nn.Module):
 
     def _forward_backbone(self, depth: torch.Tensor, state: torch.Tensor, hx: torch.Tensor | None):
         feat = self.stem(depth)
+        #这里将深度图像特征和低维状态向量相加在一起，然后通过一个线性层进行投影，得到一个192维的特征向量。
         feat = self.activation(feat + self.v_proj(state))
         if hx is None:#hx：GRU 的隐藏状态。如果是 None 就在这里初始化。
             hx = depth.new_zeros(depth.shape[0], self.hidden_size)

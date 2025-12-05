@@ -37,7 +37,7 @@ def parse_args():
     parser.add_argument("--linear_lr", action="store_true", default=True)
     parser.add_argument("--hidden_size", type=int, default=192)
     parser.add_argument("--seq_len", type=int, default=32, help="Sequence length for RNN training")
-    parser.add_argument("--log_dir", type=str, default="runs/ppo_1")
+    parser.add_argument("--log_dir", type=str, default="runs/ppo")
     parser.add_argument("--save_interval", type=int, default=50000)
     parser.add_argument("--ctl_dt_mean", type=float, default=1 / 15)
     parser.add_argument("--ctl_dt_std", type=float, default=0.1 / 15)
@@ -496,7 +496,7 @@ def main():
             ent_coef_now = args.ent_coef
         else:
             decay_frac = (ent_progress - 2.0 / 3.0) / (1.0 / 3.0)
-            ent_coef_now = args.ent_coef * max(0.1, 1.0 - decay_frac)
+            ent_coef_now = args.ent_coef * max(0, 1.0 - decay_frac)
 
         env.reset()
         model.reset()
@@ -648,8 +648,9 @@ def main():
             reward -= args.coef_bias * bias_loss
             # 连续时间惩罚：按真实物理时间扣，每经过 ctl_dt 秒就扣 coef_alive * ctl_dt
             # 这样总惩罚大致与 episode 实际飞行时间成正比，比按“步数”更连续
-            # time_cost = ctl_dt * args.coef_alive
-            # reward -= time_cost
+            # 目前还在考虑加不加这个惩罚
+            time_cost = ctl_dt * args.coef_alive
+            reward -= time_cost
             # 控制平滑惩罚：动作过大 / 抖动
             reward -= smooth_penalty
             # 避障 shaping 惩罚
@@ -662,6 +663,7 @@ def main():
             # 目标附近的连续奖励：距离越近越大，远处近似为 0（纯密集奖励）
             # 0.5 和 3.0 是经验初始值，可根据场景大小和 reward 量级再调
             goal_bonus = args.coef_goal_bonus * torch.exp(-new_goal_distance / 3.0)
+            goal_bonus = goal_bonus * (~success).float()
             reward += goal_bonus
 
             buffer.add(depth, state_vec, action, logprob, value, reward, done.float(), hx_in)
