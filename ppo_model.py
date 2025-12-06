@@ -21,7 +21,6 @@ class PPONetwork(nn.Module):
         super().__init__()
         self.dim_action = dim_action
         self.hidden_size = hidden_size
-
         # CNN stem copied from model.py
         #作用：把深度图像提取成一个长度为 hidden_size 的视觉特征向量。
         self.stem = nn.Sequential(
@@ -50,6 +49,7 @@ class PPONetwork(nn.Module):
         self.actor = nn.Sequential(
             nn.Linear(hidden_size, hidden_size, bias=False),
             nn.LeakyReLU(0.05),
+          
             nn.Linear(hidden_size, dim_action * 2, bias=False),
         )
         #手动把权重乘 0.01，相当于减小初始权重的幅度。
@@ -61,6 +61,7 @@ class PPONetwork(nn.Module):
         self.value_head = nn.Sequential(
             nn.Linear(hidden_size, 2*hidden_size, bias=False),
             nn.LeakyReLU(0.05),
+          
             nn.Linear(2*hidden_size, 1, bias=False),
         )
 

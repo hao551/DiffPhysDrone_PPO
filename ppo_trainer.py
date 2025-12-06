@@ -27,17 +27,23 @@ def parse_args():
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--gae_lambda", type=float, default=0.95)
     parser.add_argument("--ppo_epochs", type=int, default=6)
-    parser.add_argument("--num_minibatches", type=int, default=8)
-    parser.add_argument("--clip_range", type=float, default=0.15)
+    parser.add_argument("--num_minibatches", type=int, default=16)
+    parser.add_argument("--clip_range", type=float, default=0.25)
+    parser.add_argument(
+        "--target_kl",
+        type=float,
+        default=0.01,
+        help="Early-stop threshold for approx KL; set 0 to disable",
+    )
     parser.add_argument("--clip_vloss", type=float, default=0.2)
     parser.add_argument("--vf_coef", type=float, default=0.5)
     parser.add_argument("--ent_coef", type=float, default=0.01)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
-    parser.add_argument("--lr", type=float, default=2e-5)
+    parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--linear_lr", action="store_true", default=True)
     parser.add_argument("--hidden_size", type=int, default=192)
     parser.add_argument("--seq_len", type=int, default=32, help="Sequence length for RNN training")
-    parser.add_argument("--log_dir", type=str, default="runs/ppo")
+    parser.add_argument("--log_dir", type=str, default="runs/ppo_1")
     parser.add_argument("--save_interval", type=int, default=50000)
     parser.add_argument("--ctl_dt_mean", type=float, default=1 / 15)
     parser.add_argument("--ctl_dt_std", type=float, default=0.1 / 15)
@@ -466,6 +472,8 @@ def main():
     #args.num_steps（比如 128）：每个 rollout 采集多少步
     #args.batch_size（比如 512）：并行多少架无人机
     #args.hidden_size（比如 192）：RNN 隐状态的维度
+    # 默认 batch_size=512，所以一次 rollout 同时跑 512 个环境，循环 num_steps 步，
+    # 每步都会对 512 条并行轨迹采样并写入 buffer（done 的会即时重置后继续采样），总样本量是 num_steps * batch_size
     buffer = RolloutBuffer(args.num_steps, args.batch_size, args.hidden_size, device)
 
     # ==== 新增：价值归一化器（对 returns 做滑动标准化） ====
@@ -756,6 +764,7 @@ def main():
         clip_fraction = 0.0
         nbatches = 0
 
+        early_stop = False
         for _ in range(args.ppo_epochs):
             for batch in buffer.get_minibatches(args.num_minibatches, args.seq_len):
                 # Initial hidden state for the sequence
@@ -795,7 +804,16 @@ def main():
                 b_value = batch["value"].flatten(0, 1)
                 b_returns = batch["returns"].flatten(0, 1)
 
-                ratio = (new_logprob - b_logprob).exp()
+                log_ratio = new_logprob - b_logprob
+                ratio = log_ratio.exp()
+                # KL 仅用于监控与早停，不参与梯度
+                with torch.no_grad():
+                    approx_kl = ((ratio - 1) - log_ratio).mean()
+                # 超过阈值则提前结束本轮更新，避免过大策略步长
+                if approx_kl > args.target_kl:
+                    early_stop = True
+                    break
+
                 surr1 = ratio * b_advantage
                 surr2 = torch.clamp(ratio, 1.0 - args.clip_range, 1.0 + args.clip_range) * b_advantage
                 policy_loss = -torch.min(surr1, surr2).mean()
@@ -819,14 +837,17 @@ def main():
                 optim.step()
 
                 with torch.no_grad():
-                    approx_kl = (b_logprob - new_logprob).mean().abs()
-                    clip_fraction += (torch.abs(ratio - 1.0) > args.clip_range).float().mean().item()
+                    clip_fraction += (ratio.sub(1.0).abs() > args.clip_range).float().mean().item()
+                    # approx_kl = (b_logprob - new_logprob).mean().abs()
+                    # clip_fraction += (torch.abs(ratio - 1.0) > args.clip_range).float().mean().item()
 
                 policy_loss_total += policy_loss.item()
                 value_loss_total += value_loss.item()
                 entropy_total += entropy.mean().item()
                 approx_kl_total += approx_kl.item()
                 nbatches += 1
+            if early_stop:
+                break
 
         buffer.clear()
         global_step += args.num_steps * args.batch_size
